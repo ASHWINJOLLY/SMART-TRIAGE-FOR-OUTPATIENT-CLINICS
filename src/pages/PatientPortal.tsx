@@ -1,0 +1,554 @@
+import { useState, useRef, useEffect } from 'react';
+import { useLocation } from 'react-router-dom';
+import { Send, Printer, User, Building2, Mic, MicOff, Paperclip, X, Image as ImageIcon } from 'lucide-react';
+import { QRCodeSVG } from 'qrcode.react';
+import type { ChatMessage, TriageResult } from '../types';
+import { triagePatient } from '../api/client';
+import { performTriage } from '../utils/triageLogic';
+import EmergencyAlertModal from '../components/triage/EmergencyAlertModal';
+import TriageResultCard from '../components/triage/TriageResultCard';
+
+const API_BASE = 'http://localhost:8000';
+
+const BOT_QUESTIONS = [
+  'Hello! I\'m SYMPTORA, your AI triage assistant. 🙏 Please tell me your name.',
+  'What is your age? (Age in years)',
+  'What is your gender? (Male / Female / Other)',
+  'What is your chief complaint? (Briefly describe your symptoms)',
+  'How long have you been experiencing this? (1-3 days / 1 week / More than 1 month)',
+  'Do you have fever, breathing difficulty, or chest pain? (Yes / No)',
+  'Are you currently on any medication? (Yes / No)',
+];
+
+  const PREGNANCY_QUESTION = 'Are you pregnant? (Yes / No)';
+
+export default function PatientPortal() {
+  const location = useLocation();
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState('');
+  
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const prefill = params.get('prefill');
+    if (prefill) {
+      setInput(prefill);
+    }
+  }, [location.search]);
+
+  const [currentStep, setCurrentStep] = useState(0);
+  const [answers, setAnswers] = useState<string[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [triageComplete, setTriageComplete] = useState(false);
+  const [showEmergency, setShowEmergency] = useState(false);
+  const [emergencyResult, setEmergencyResult] = useState<TriageResult | null>(null);
+  const [lang, setLang] = useState<'hi-IN' | 'en-US'>('en-US');
+  const [isListening, setIsListening] = useState(false);
+  const [selectedImage, setSelectedImage] = useState<File | null>(null);
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string>('');
+  const [ocrProcessing, setOcrProcessing] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const toggleListening = () => {
+    if (isListening) {
+      setIsListening(false);
+      return;
+    }
+
+    const SpeechRecognition = window.SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert("Browser does not support Speech Recognition. Please try Chrome.");
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = lang;
+    recognition.continuous = false;
+    recognition.interimResults = false;
+
+    recognition.onstart = () => setIsListening(true);
+    recognition.onresult = (event: any) => {
+      const transcript = event.results[0][0].transcript;
+      setInput(transcript);
+      // Optional: auto-send after a tiny delay to ensure input is updated, but user asked to auto-send
+      setTimeout(() => handleSend(transcript), 300);
+    };
+    recognition.onerror = () => setIsListening(false);
+    recognition.onend = () => setIsListening(false);
+
+    recognition.start();
+  };
+
+  const playEmergencyBeep = () => {
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const playBeep = () => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(800, ctx.currentTime);
+        osc.frequency.setValueAtTime(1200, ctx.currentTime + 0.2);
+        gain.gain.setValueAtTime(0, ctx.currentTime);
+        gain.gain.linearRampToValueAtTime(0.2, ctx.currentTime + 0.1);
+        gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.5);
+      };
+      playBeep();
+      let count = 1;
+      const interval = setInterval(() => {
+        if (count >= 3) {
+          clearInterval(interval);
+          return;
+        }
+        playBeep();
+        count++;
+      }, 600);
+    } catch(e) {
+      console.log('Audio error:', e);
+    }
+  };
+
+  const enrichTriageResult = (res: any, demoAnswers?: string[]) => {
+    const newRes = { ...res };
+    if (!newRes.name && demoAnswers) newRes.name = demoAnswers[0];
+    if (!newRes.age && demoAnswers) newRes.age = demoAnswers[1];
+    
+    if (newRes.triageLevel === 'critical') {
+      newRes.waitTimeStr = "0–3 mins";
+      newRes.queueStr = "PRIORITY OVERRIDE";
+    } else if (newRes.triageLevel === 'moderate') {
+      newRes.waitTimeStr = `~${newRes.waitTimeMinutes || Math.floor(Math.random() * 21) + 25} minutes`;
+      newRes.queueStr = `#${newRes.queuePosition || Math.floor(Math.random() * 13) + 8}`;
+    } else {
+      newRes.waitTimeStr = `~${newRes.waitTimeMinutes || Math.floor(Math.random() * 21) + 40} minutes`;
+      newRes.queueStr = `#${newRes.queuePosition || Math.floor(Math.random() * 16) + 15}`;
+    }
+    return newRes;
+  };
+
+  const handleDemoFill = async (caseType: 'critical' | 'moderate' | 'ortho') => {
+    let symptomText = '';
+    if (caseType === 'critical') symptomText = 'I have severe chest pain and difficulty breathing';
+    else if (caseType === 'moderate') symptomText = 'I have fever and stomach pain';
+    else symptomText = 'My leg is broken, severe pain';
+
+    setInput(symptomText);
+  };
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  // Send initial bot message
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      addBotMessage(BOT_QUESTIONS[0]);
+    }, 500);
+    return () => clearTimeout(timer);
+  }, []);
+
+  const addBotMessage = (text: string) => {
+    const msg: ChatMessage = {
+      id: crypto.randomUUID(),
+      text,
+      sender: 'bot',
+      timestamp: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true }),
+    };
+    setMessages(prev => [...prev, msg]);
+  };
+
+  const addUserMessage = (text: string) => {
+    const msg: ChatMessage = {
+      id: crypto.randomUUID(),
+      text,
+      sender: 'user',
+      timestamp: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true }),
+    };
+    setMessages(prev => [...prev, msg]);
+  };
+
+  const addTriageResultMessage = (result: TriageResult) => {
+    const msg: ChatMessage = {
+      id: crypto.randomUUID(),
+      text: '',
+      sender: 'bot',
+      timestamp: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true }),
+      isTriageResult: true,
+      triageResult: result,
+    };
+    setMessages(prev => [...prev, msg]);
+  };
+
+  const getTotalQuestions = () => {
+    // If gender is female (answer at index 2), add pregnancy question
+    if (answers.length > 2 && answers[2]?.toLowerCase() === 'female') {
+      return BOT_QUESTIONS.length + 1;
+    }
+    return BOT_QUESTIONS.length;
+  };
+
+  const getNextQuestion = (step: number, currentAnswers: string[]): string | null => {
+    if (step < BOT_QUESTIONS.length) {
+      return BOT_QUESTIONS[step];
+    }
+    // After all standard questions, check if we need pregnancy question
+    if (step === BOT_QUESTIONS.length && currentAnswers[2]?.toLowerCase() === 'female') {
+      return PREGNANCY_QUESTION;
+    }
+    return null;
+  };
+
+  const handleSend = async (overrideInput?: string) => {
+    const textToSend = typeof overrideInput === 'string' ? overrideInput : input;
+    if (!textToSend.trim() || isLoading || triageComplete) return;
+
+    const userText = textToSend.trim();
+    if (!overrideInput) setInput('');
+    addUserMessage(userText);
+
+    const newAnswers = [...answers, userText];
+    setAnswers(newAnswers);
+
+    const nextStep = currentStep + 1;
+    setCurrentStep(nextStep);
+
+    const nextQ = getNextQuestion(nextStep, newAnswers);
+
+    if (nextQ) {
+      setTimeout(() => addBotMessage(nextQ), 600);
+    } else {
+      // All questions answered — perform triage
+      setIsLoading(true);
+      addBotMessage('Generating your triage report... 🏥');
+
+      try {
+        const isFemale = newAnswers[2]?.toLowerCase() === 'female';
+        const hasCriticalSymptoms = newAnswers[5]?.toLowerCase().includes('haan') || newAnswers[5]?.toLowerCase() === 'yes';
+        const onMedication = newAnswers[6]?.toLowerCase().includes('haan') || newAnswers[6]?.toLowerCase() === 'yes';
+        const isPregnant = isFemale && newAnswers[7] ? (newAnswers[7].toLowerCase().includes('haan') || newAnswers[7].toLowerCase() === 'yes') : undefined;
+
+        const triageInput = {
+          name: newAnswers[0],
+          age: parseInt(newAnswers[1]) || 30,
+          gender: newAnswers[2],
+          chiefComplaint: newAnswers[3],
+          duration: newAnswers[4],
+          hasCriticalSymptoms,
+          onMedication,
+          isPregnant,
+        };
+
+        let result: any;
+
+        try {
+          result = await triagePatient(triageInput);
+        } catch {
+          result = performTriage(triageInput);
+        }
+
+        result = enrichTriageResult(result, newAnswers);
+
+        if (result.isEmergency || result.triageLevel === 'critical') {
+          setEmergencyResult(result);
+          setShowEmergency(true);
+          playEmergencyBeep();
+        } else {
+          addTriageResultMessage(result);
+        }
+        setTriageComplete(true);
+      } catch (err) {
+        addBotMessage('Sorry, a technical issue occurred. Please try again. 🙏');
+      } finally {
+        setIsLoading(false);
+      }
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') handleSend();
+  };
+
+  const handlePrint = () => {
+    window.print();
+  };
+
+  // =================== OCR / IMAGE UPLOAD ===================
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // 5MB check
+    if (file.size > 5 * 1024 * 1024) {
+      addBotMessage('⚠️ Image exceeds 5MB limit. Please upload a smaller image.');
+      return;
+    }
+
+    setSelectedImage(file);
+    setImagePreviewUrl(URL.createObjectURL(file));
+  };
+
+  const clearSelectedImage = () => {
+    setSelectedImage(null);
+    setImagePreviewUrl('');
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleOcrTriage = async () => {
+    if (!selectedImage || ocrProcessing) return;
+
+    setOcrProcessing(true);
+
+    // Show image in chat as user message
+    const imgMsg: ChatMessage = {
+      id: crypto.randomUUID(),
+      text: `📎 ${selectedImage.name}`,
+      sender: 'user',
+      timestamp: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true }),
+    };
+    setMessages(prev => [...prev, imgMsg]);
+
+    // Show loading
+      addBotMessage('🔍 SYMPTORA is reading your prescription...');
+
+    try {
+      const formData = new FormData();
+      formData.append('image', selectedImage);
+      formData.append('language', lang === 'hi-IN' ? 'hi' : 'en');
+
+      const res = await fetch(`${API_BASE}/api/ocr-triage`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!res.ok) throw new Error(`API error: ${res.status}`);
+      const data = await res.json();
+
+      // Low confidence → show warning
+      if (data.ocr_confidence === 'low') {
+        addBotMessage(`⚠️ Image is not clear. ${data.extracted_text || 'Please try again or type your symptoms.'}`);
+        clearSelectedImage();
+        setOcrProcessing(false);
+        return;
+      }
+
+      // Build analysis summary
+      const symptoms = data.symptoms_found?.length > 0 ? data.symptoms_found.join(', ') : 'Not detected';
+      const medicines = data.medicines_found?.length > 0 ? data.medicines_found.join(', ') : 'None found';
+      const summaryText = `📋 Prescription Analysis Complete\n\nSymptoms: ${symptoms}\nMedicines: ${medicines}\n${data.urgency_reason ? `Reason: ${data.urgency_reason}` : ''}`;
+      addBotMessage(summaryText);
+
+      // Show triage result
+      if (data.triage_result) {
+        const tr: TriageResult = {
+          token: data.triage_result.token || data.token || 'OPD-0000',
+          triageLevel: data.triage_result.triageLevel || 'mild',
+          department: data.triage_result.department || 'General OPD',
+          waitTimeMinutes: data.triage_result.waitTimeMinutes || 30,
+          queuePosition: data.triage_result.queuePosition || 1,
+          message: data.triage_result.message || '',
+          aiReasoning: data.triage_result.aiReasoning || data.urgency_reason || '',
+          assignedDoctor: data.triage_result.assignedDoctor,
+          roomNumber: data.triage_result.roomNumber,
+          isEmergency: data.triage_result.isEmergency || false,
+        };
+
+        if (tr.isEmergency || tr.triageLevel === 'critical') {
+          setEmergencyResult(tr);
+          setShowEmergency(true);
+          playEmergencyBeep();
+        } else {
+          addTriageResultMessage(tr);
+        }
+        setTriageComplete(true);
+      }
+
+    } catch (err) {
+      console.error('OCR triage error:', err);
+      addBotMessage('Sorry, image analysis failed. Please try again or type your symptoms. 🙏');
+    } finally {
+      clearSelectedImage();
+      setOcrProcessing(false);
+    }
+  };
+
+  const getTriageLevelDisplay = (level: string) => {
+    switch (level) {
+      case 'critical': return { emoji: '🔴', text: 'Critical', color: '#ef4444' };
+      case 'moderate': return { emoji: '🟡', text: 'Moderate', color: '#f59e0b' };
+      case 'mild': return { emoji: '🟢', text: 'Mild', color: '#22c55e' };
+      default: return { emoji: '⚪', text: level, color: '#94a3b8' };
+    }
+  };
+
+  return (
+    <div className="wa-container">
+      {showEmergency && emergencyResult && (
+        <EmergencyAlertModal result={emergencyResult} onDismiss={() => setShowEmergency(false)} />
+      )}
+      {/* WhatsApp-style header */}
+      <div className="wa-header">
+        <div className="avatar">S</div>
+        <div className="info" style={{ flex: 1 }}>
+          <h3>SYMPTORA</h3>
+          <p>OPD Triage Assistant • 🟢 Online</p>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <button 
+            onClick={() => setLang(l => l === 'en-US' ? 'hi-IN' : 'en-US')}
+            style={{ background: 'transparent', border: '1px solid rgba(255,255,255,0.2)', color: 'white', padding: '4px 8px', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}
+          >
+            {lang === 'en-US' ? 'हिंदी' : 'English'}
+          </button>
+        </div>
+      </div>
+
+      {/* Messages */}
+      <div className="wa-messages">
+        {messages.map(msg => (
+          <div key={msg.id}>
+            {msg.isTriageResult && msg.triageResult ? (
+              <TriageResultCard result={msg.triageResult} onPrint={handlePrint} />
+            ) : (
+              <div style={{ display: 'flex', gap: '8px', alignSelf: msg.sender === 'bot' ? 'flex-start' : 'flex-end', maxWidth: '85%' }}>
+                {msg.sender === 'bot' && (
+                  <div style={{ width: 24, height: 24, borderRadius: '50%', background: 'rgba(0, 212, 170, 0.2)', color: '#00d4aa', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, flexShrink: 0, marginTop: 4 }}>S</div>
+                )}
+                <div className={`wa-bubble ${msg.sender}`}>
+                  {msg.text}
+                  <div className="time">{msg.timestamp}</div>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+        {isLoading && (
+          <div className="wa-bubble bot" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div className="spinner" style={{ width: 20, height: 20, borderWidth: 2 }}></div>
+            <span>Analyzing<span className="loading-dots"></span></span>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Demo Buttons */}
+      <div className="no-print" style={{ display: 'flex', gap: '12px', padding: '0 24px', marginBottom: '16px', justifyContent: 'center', flexWrap: 'wrap' }}>
+        <button 
+          onClick={() => handleDemoFill('critical')}
+          disabled={isLoading || triageComplete}
+          className="demo-btn-triage demo-triage-critical"
+        >
+          🚨 Try: Chest Pain
+        </button>
+        <button 
+          onClick={() => handleDemoFill('moderate')}
+          disabled={isLoading || triageComplete}
+          className="demo-btn-triage demo-triage-moderate"
+        >
+          ⚠️ Try: Fever
+        </button>
+        <button 
+          onClick={() => handleDemoFill('ortho')}
+          disabled={isLoading || triageComplete}
+          className="demo-btn-triage demo-triage-ortho"
+        >
+          ✅ Try: Fracture
+        </button>
+      </div>
+
+      {/* Image Preview Bar */}
+      {selectedImage && imagePreviewUrl && (
+        <div className="ocr-preview-bar no-print">
+          <div className="ocr-preview-thumb">
+            <img src={imagePreviewUrl} alt="Selected" />
+          </div>
+          <div className="ocr-preview-info">
+            <span className="ocr-preview-name">{selectedImage.name}</span>
+            <span className="ocr-preview-size">{(selectedImage.size / 1024).toFixed(0)} KB</span>
+          </div>
+          <button className="ocr-preview-remove" onClick={clearSelectedImage} title="Remove">
+            <X size={16} />
+          </button>
+          <button
+            className="ocr-analyze-btn"
+            onClick={handleOcrTriage}
+            disabled={ocrProcessing}
+          >
+            {ocrProcessing ? (
+              <><div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }}></div> Analyzing...</>
+            ) : (
+              <><ImageIcon size={14} /> Analyze Prescription</>
+            )}
+          </button>
+        </div>
+      )}
+
+      {/* Input area */}
+      <div className="wa-input-area no-print" style={{ position: 'relative' }}>
+        {/* Hidden file input */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*,.pdf"
+          onChange={handleImageSelect}
+          style={{ display: 'none' }}
+        />
+        {/* Attachment button */}
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          disabled={isLoading || triageComplete || ocrProcessing}
+          className="ocr-attach-btn"
+          title="Upload prescription or symptom photo"
+        >
+          <Paperclip size={20} />
+        </button>
+        <button 
+          onClick={toggleListening} 
+          disabled={isLoading || triageComplete}
+          style={{ 
+            background: 'transparent', 
+            border: 'none', 
+            color: isListening ? '#ef4444' : '#94a3b8',
+            cursor: 'pointer',
+            padding: '8px',
+            animation: isListening ? 'pulse-dot 1.5s infinite' : 'none'
+          }}
+          title="Click mic and speak your symptoms"
+        >
+          {isListening ? <Mic size={22} /> : <MicOff size={22} />}
+        </button>
+        <input
+          type="text"
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder={isListening ? 'Listening...' : (triageComplete ? 'Triage complete ✓' : 'Describe your symptoms in English or Hindi...')}
+          disabled={isLoading || triageComplete || isListening}
+          style={{ flex: 1 }}
+        />
+        <button className="send-btn-teal" onClick={() => handleSend()} disabled={!input.trim() || isLoading || triageComplete}>
+          <Send size={18} />
+        </button>
+      </div>
+
+      {/* QR Code section */}
+      <div className="qr-section no-print">
+        <h4>📱 Scan to access on mobile</h4>
+        <QRCodeSVG
+          value="http://localhost:5173/patient"
+          size={90}
+          bgColor="transparent"
+          fgColor="#00d4aa"
+          level="M"
+        />
+      </div>
+
+      <div className="watermark">TEAM FELIX | AAYAM 2026</div>
+    </div>
+  );
+}
